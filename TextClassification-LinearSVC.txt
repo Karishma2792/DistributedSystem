@@ -1,0 +1,111 @@
+
+-- Start Spark
+
+spark-shell --master yarn
+
+import org.apache.spark.sql.functions._
+import org.apache.spark.sql.expressions.Window
+import org.apache.spark.ml.feature.{RegexTokenizer, StopWordsRemover, CountVectorizer, NGram, IDF, VectorAssembler}
+import org.apache.spark.ml.Pipeline
+import org.apache.spark.ml.classification.{LinearSVC}
+import org.apache.spark.ml.tuning.{CrossValidator, CrossValidatorModel, ParamGridBuilder}
+import org.apache.spark.ml.evaluation.MulticlassClassificationEvaluator
+import org.apache.spark.ml.param.ParamMap
+
+
+//Load data
+val raw_reviews = spark.read
+ .format("json")
+ .load("hdfs://internal-ip-gcp:8020/BigData/yelp-reviews/review-10000.json")
+ 
+
+//Don't consider 3 ratings 
+val reviews_not3 = raw_reviews.filter(col("stars") =!= 3)
+
+//Make 4 and 5 rating 0; 2 and 1 rating 1
+val reviews = reviews_not3.select(col("stars"), col("text") ,row_number().over(Window.partitionBy("stars").orderBy(col("stars"))).alias("row_num"))
+ .withColumn("stars_normalized", when($"stars" === "4", 0).otherwise(when($"stars" === "2", 1).otherwise(0)))
+
+//Split words
+val tokenizer = new RegexTokenizer()
+ .setPattern("[a-zA-Z']+")
+ .setGaps(false)
+ .setInputCol("text")
+ .setOutputCol("words")
+
+//Remove common words like is, a etc.
+val remover = new StopWordsRemover()
+ .setInputCol("words")
+ .setOutputCol("filtered")
+
+//Bigram - make words pair
+val ngram = new NGram()
+ .setN(2)
+ .setInputCol("filtered")
+ .setOutputCol("ngram-2")
+
+//Index the bigrams
+val cv2: CountVectorizer = new CountVectorizer()
+ .setInputCol("ngram-2")
+ .setOutputCol("ngram-2-features")
+
+//Suppress most common words
+val cv2idf = new IDF()
+ .setInputCol("ngram-2-features")
+ .setOutputCol("cv2-idf-features")
+
+//Train the model with LinearSVC 
+val lsvc = new LinearSVC()
+ .setFeaturesCol("cv2-idf-features")
+ .setLabelCol("stars_normalized")
+
+val pipeline = new Pipeline()
+ .setStages(Array(tokenizer, remover, ngram, cv2, cv2idf, lsvc))
+
+val evaluator = new MulticlassClassificationEvaluator()
+ .setLabelCol("stars_normalized")
+ .setPredictionCol("prediction")
+ .setMetricName("accuracy")
+
+//Cross validate model
+val cross_validator = new CrossValidator()
+ .setEstimator(pipeline)
+ .setEvaluator(evaluator)
+ .setEstimatorParamMaps(new ParamGridBuilder().build)
+ .setNumFolds(3) 
+ 
+val Array(trainingData, testData) = reviews.randomSplit(Array(0.8, 0.2), 754) 
+
+//Train the model on training data
+val model = cross_validator.fit(trainingData)
+
+//Test the model on test data
+val predictions = model.transform(testData)
+
+//Evaluate accuracy
+val accuracy = evaluator.evaluate(predictions)
+println("accuracy on test data = " + accuracy)
+
+
+//Save the model for reuse
+model.save("hdfs://internal-ip-gcp:8020/BigData/yelp-review-model")
+
+//Reuse the model to make predicts on new data
+val saved_model = CrossValidatorModel.load("hdfs://internal-ip-gcp:8020/BigData/yelp-review-model")
+
+val new_raw_reviews = spark.read
+ .format("json")
+ .load("hdfs://:8020/BigData/yelp-reviews/new-reviews.json")
+ 
+//Don't consider 3 ratings 
+val new_reviews_not3 = new_raw_reviews.filter(col("stars") =!= 3)
+
+//Make 4 and 5 rating 0; 2 and 1 rating 1
+val new_reviews = new_reviews_not3.select(col("stars"), col("text") ,row_number().over(Window.partitionBy("stars").orderBy(col("stars"))).alias("row_num"))
+ .withColumn("stars_normalized", when($"stars" === "4", 0).otherwise(when($"stars" === "2", 1).otherwise(0)))
+
+val new_predictions = saved_model.transform(new_reviews)
+
+//Evaluate accuracy
+val new_accuracy = evaluator.evaluate(new_predictions)
+println("accuracy on new data = " + new_accuracy)
